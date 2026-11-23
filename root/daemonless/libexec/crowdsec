@@ -1,0 +1,152 @@
+#!/bin/sh
+# Start CrowdSec; /init drops to the run user during container boot, and dsu
+# drops root if invoked directly via podman exec.
+
+if [ "$(id -u)" -eq 0 ]; then
+    run_user="${DAEMONLESS_USER:-bsd}"
+    run_home=$(getent passwd "${run_user}" | cut -d: -f6)
+    export HOME="${run_home:-/config}" USER="${run_user}" LOGNAME="${run_user}"
+    exec dsu "${run_user}" "$0" "$@"
+fi
+
+# Load secrets from *_FILE environment variables so values reach the daemon.
+for var in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)_FILE=.*/\1_FILE/p'); do
+    base_var="${var%_FILE}"
+    eval "file_path=\${${var}}"
+    if [ -n "${file_path}" ] && [ -f "${file_path}" ]; then
+        export "${base_var}=$(cat "${file_path}")"
+    else
+        echo "[crowdsec] Warning: secret file '${file_path}' for ${var} not found" >&2
+    fi
+done
+
+export HOME=/config
+
+CONFIG_DIR=/config/etc
+DATA_DIR=/config/data
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+
+istrue() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+cscli() {
+    /usr/local/bin/cscli -c "${CONFIG_FILE}" "$@"
+}
+
+mkdir -p "${CONFIG_DIR}/acquis.d" "${CONFIG_DIR}/hub" \
+         "${CONFIG_DIR}/notifications" "${DATA_DIR}/trace"
+
+# Seed /config/etc once from packaged defaults so user changes survive upgrades.
+if [ ! -f "${CONFIG_FILE}" ]; then
+    cp -Rn /defaults/etc/crowdsec/. "${CONFIG_DIR}/"
+    chmod 600 "${CONFIG_FILE}" 2>/dev/null || true
+    chmod 600 "${CONFIG_DIR}"/notifications/*.yaml 2>/dev/null || true
+fi
+
+if istrue "${DISABLE_ONLINE_API:-false}"; then
+    sed -i '' \
+        -e 's|^    online_client:|    #online_client:|' \
+        -e 's|^      credentials_path: .*online_api_credentials\.yaml|      #credentials_path: /usr/local/etc/crowdsec/online_api_credentials.yaml|' \
+        "${CONFIG_FILE}"
+else
+    online_creds="${CONFIG_DIR}/online_api_credentials.yaml"
+    if [ ! -s "${online_creds}" ]; then
+        if cscli capi register; then
+            chmod 600 "${online_creds}" 2>/dev/null || true
+        else
+            echo "[crowdsec] Warning: CAPI registration failed, continuing" >&2
+            touch "${online_creds}" && chmod 600 "${online_creds}" 2>/dev/null || true
+        fi
+    fi
+fi
+
+creds_file="${CONFIG_DIR}/local_api_credentials.yaml"
+machine_count=$(cscli machines list -o json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+if [ ! -s "${creds_file}" ] || [ "${machine_count:-0}" -eq 0 ]; then
+    machine="${CUSTOM_HOSTNAME:-localhost}"
+    cscli machines delete "${machine}" >/dev/null 2>&1 || true
+    cscli machines add "${machine}" --auto --force
+fi
+if [ -f "${creds_file}" ]; then
+    if [ -n "${LOCAL_API_URL:-}" ]; then
+        sed -i '' -e "s|^url:.*|url: ${LOCAL_API_URL}|" "${creds_file}"
+    else
+        sed -i '' -e 's|^url: http://0\.0\.0\.0:|url: http://127.0.0.1:|' "${creds_file}"
+    fi
+    chmod 600 "${creds_file}" 2>/dev/null || true
+fi
+
+if ! istrue "${DISABLE_AGENT:-false}"; then
+    if ! istrue "${NO_HUB_UPGRADE:-false}"; then
+        if [ ! -f "${CONFIG_DIR}/hub/.index.json" ] || \
+           [ -z "$(find "${CONFIG_DIR}/hub/.index.json" -mtime -1 2>/dev/null)" ]; then
+            cscli hub update || echo "[crowdsec] Warning: hub update failed, continuing" >&2
+        fi
+        cscli hub upgrade || echo "[crowdsec] Warning: hub upgrade failed, continuing" >&2
+    fi
+
+    parser_count=$(cscli parsers list -o json 2>/dev/null | jq '.parsers | length' 2>/dev/null || echo 0)
+    if [ "${parser_count:-0}" -eq 0 ]; then
+        cscli parsers install crowdsecurity/whitelists || true
+    fi
+
+    install_items() {
+        item_type="$1"
+        items="$2"
+        [ -n "${items}" ] || return 0
+        for item in ${items}; do
+            cscli "${item_type}" install "${item}" || \
+                echo "[crowdsec] Warning: failed to install ${item_type} ${item}" >&2
+        done
+    }
+
+    install_items collections "${COLLECTIONS:-}"
+    install_items parsers "${PARSERS:-}"
+    install_items scenarios "${SCENARIOS:-}"
+    install_items postoverflows "${POSTOVERFLOWS:-}"
+    install_items appsec-configs "${APPSEC_CONFIGS:-}"
+    install_items appsec-rules "${APPSEC_RULES:-}"
+fi
+
+if ! istrue "${DISABLE_ONLINE_API:-false}" && [ -n "${ENROLL_KEY:-}" ]; then
+    set --
+    if [ -n "${ENROLL_INSTANCE_NAME:-}" ]; then
+        set -- "$@" --name "${ENROLL_INSTANCE_NAME}"
+    fi
+    if [ -n "${ENROLL_TAGS:-}" ]; then
+        for tag in ${ENROLL_TAGS}; do
+            set -- "$@" --tags "${tag}"
+        done
+    fi
+    cscli console enroll "$@" "${ENROLL_KEY}" || \
+        echo "[crowdsec] Warning: console enrollment failed, continuing" >&2
+fi
+
+existing_bouncers=$(cscli bouncers list -o json 2>/dev/null | jq -r '.[].name' 2>/dev/null || true)
+for var in $(env | sed -n 's/^\(BOUNCER_KEY_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    case "${var}" in
+        *_FILE) continue ;;
+    esac
+    name="${var#BOUNCER_KEY_}"
+    eval "key=\${${var}}"
+    [ -n "${name}" ] && [ -n "${key}" ] || continue
+    if ! printf '%s\n' "${existing_bouncers}" | grep -qx "${name}"; then
+        if cscli bouncers add "${name}" -k "${key}" >/dev/null; then
+            echo "[crowdsec] Registered bouncer ${name}"
+            existing_bouncers=$(printf '%s\n%s' "${existing_bouncers}" "${name}")
+        else
+            echo "[crowdsec] Warning: failed to register bouncer ${name}" >&2
+        fi
+    fi
+done
+
+set -- -c "${CONFIG_FILE}"
+if istrue "${DISABLE_AGENT:-false}"; then
+    set -- "$@" -no-cs
+fi
+
+exec /usr/local/bin/crowdsec "$@"

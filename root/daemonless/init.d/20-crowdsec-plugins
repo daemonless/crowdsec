@@ -1,0 +1,10 @@
+#!/bin/sh
+# CrowdSec only loads notification plugins owned by the user it runs as, so
+# follow a PUID remap of bsd. Skipped when not root or already correct.
+dir=/usr/local/lib/crowdsec/plugins
+
+[ "$(id -u)" -eq 0 ] || exit 0
+[ -n "$(find "${dir}" ! -user bsd 2>/dev/null)" ] || exit 0
+chown -R bsd:bsd "${dir}" || \
+    echo "[crowdsec] Warning: cannot chown ${dir}; notification plugins will not load" >&2
+exit 0
