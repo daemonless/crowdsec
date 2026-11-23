@@ -1,0 +1,24 @@
+# dbuild configuration file
+# Full reference: https://github.com/daemonless/dbuild
+
+icon: ':material-shield-lock:'
+
+build:
+  architectures:
+    - amd64
+    - aarch64
+  variants:
+    - tag: pkg
+      containerfile: Containerfile.pkg
+      aliases: ["latest"]
+      default: true
+    - tag: pkg-latest
+      containerfile: Containerfile.pkg
+      args:
+        BASE_VERSION: "15.1-latest"
+
+cit:
+  mode: health
+  port: 8080
+  health: /health
+  ready: "CrowdSec Local API listening"
